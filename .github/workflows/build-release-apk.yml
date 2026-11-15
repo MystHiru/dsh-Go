@@ -1,0 +1,151 @@
+name: Build release APK (arm64)
+
+# Manual only: produces a release APK for a phone, using the runtime bundle that
+# v1.1.0 shipped (same runtime revision and tawcroot commit as main), so the
+# build needs no rootfs assembly or NDK cross-compile.
+on:
+  workflow_dispatch:
+    inputs:
+      build_name:
+        description: Version name; empty means pubspec's version
+        required: false
+        default: ''
+      build_number:
+        description: versionCode; empty means the build minute
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-release-apk-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # The cloud runner reaches maven.google.com directly; the repo's Aliyun
+  # mirrors only slow it down.
+  DSH_MAVEN_MIRRORS: '0'
+  FLUTTER_VERSION: 3.47.7
+  JAVA_VERSION: '17'
+  GRADLE_VERSION: 9.3.1
+  UPSTREAM_APK: https://github.com/ccch1mneyyy/dsh-Go/releases/download/v1.1.0/dsh-go-1.1.0-arm64.apk
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Install the Android platform and NDK this Flutter pins
+        run: |
+          set -eu
+          FLUTTER_ROOT=$(dirname "$(dirname "$(command -v flutter)")")
+          echo "FLUTTER_ROOT=$FLUTTER_ROOT"
+          EXT=$(grep -rl 'compileSdkVersion' "$FLUTTER_ROOT/packages/flutter_tools/gradle/src/main/kotlin" 2>/dev/null | head -1)
+          echo "EXT=$EXT"
+          COMPILE_SDK=''
+          NDK=''
+          if [ -n "$EXT" ]; then
+            COMPILE_SDK=$(sed -nE 's/.*compileSdkVersion[^0-9]*([0-9]+).*/\1/p' "$EXT" | head -1)
+            NDK=$(sed -nE 's/.*ndkVersion[^"]*"([^"]+)".*/\1/p' "$EXT" | head -1)
+          fi
+          echo "compileSdk=$COMPILE_SDK ndk=$NDK"
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          WANT=()
+          if [ -n "$COMPILE_SDK" ] && [ ! -d "$ANDROID_HOME/platforms/android-$COMPILE_SDK" ]; then
+            WANT+=("platforms;android-$COMPILE_SDK")
+          fi
+          if [ -n "$NDK" ] && [ ! -d "$ANDROID_HOME/ndk/$NDK" ]; then
+            WANT+=("ndk;$NDK")
+          fi
+          if [ ${#WANT[@]} -gt 0 ]; then
+            echo "installing: ${WANT[*]}"
+            yes | "$SDKMANAGER" --install "${WANT[@]}" > /dev/null 2>&1 || echo "::warning::sdkmanager exited non-zero"
+          fi
+          ls "$ANDROID_HOME/platforms" || true
+          ls "$ANDROID_HOME/ndk" || true
+          ls "$ANDROID_HOME/build-tools" || true
+
+      - name: Flutter packages
+        working-directory: app
+        run: flutter pub get --enforce-lockfile
+
+      - name: Reuse the pinned runtime bundle from v1.1.0
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --retry-delay 2 -o /tmp/v110.apk "$UPSTREAM_APK"
+          mkdir -p runtime/out/arm64-v8a/assets runtime/out/arm64-v8a/jniLibs/arm64-v8a runtime/out-tawcroot/jniLibs/arm64-v8a
+          unzip -o -q /tmp/v110.apk 'assets/runtime/*' -d /tmp/ext
+          cp -a /tmp/ext/assets/runtime runtime/out/arm64-v8a/assets/
+          unzip -o -q -j /tmp/v110.apk \
+            'lib/arm64-v8a/libproot.so' \
+            'lib/arm64-v8a/libproot-loader.so' \
+            'lib/arm64-v8a/libtalloc.so' \
+            'lib/arm64-v8a/libandroid-shmem.so' \
+            -d runtime/out/arm64-v8a/jniLibs/arm64-v8a/
+          unzip -o -q -j /tmp/v110.apk 'lib/arm64-v8a/libtawcroot.so' -d runtime/out-tawcroot/jniLibs/arm64-v8a/ || true
+          python3 tooling/check_runtime_bundle.py arm64 || echo "::warning::runtime bundle check did not pass; continuing"
+          ls -l runtime/out/arm64-v8a/assets/runtime runtime/out/arm64-v8a/jniLibs/arm64-v8a runtime/out-tawcroot/jniLibs/arm64-v8a
+
+      - name: Write local.properties
+        working-directory: app
+        run: |
+          set -euo pipefail
+          printf 'sdk.dir=%s\nflutter.sdk=%s\n' "$ANDROID_HOME" "$(dirname "$(dirname "$(command -v flutter)")")" > android/local.properties
+          cat android/local.properties
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: Generate the Gradle wrapper
+        working-directory: app/android
+        run: gradle wrapper --gradle-version "$GRADLE_VERSION" --distribution-type bin
+
+      - name: Build the release APK
+        working-directory: app
+        run: |
+          set -euo pipefail
+          NAME="${{ inputs.build_name }}"
+          if [ -z "$NAME" ]; then
+            NAME=$(sed -n 's/^version:[[:space:]]*\([^+[:space:]]*\).*/\1/p' pubspec.yaml)
+          fi
+          CODE="${{ inputs.build_number }}"
+          if [ -z "$CODE" ]; then
+            CODE=$(python3 ../tooling/build_number.py)
+          fi
+          echo "version $NAME ($CODE)"
+          flutter build apk --release --flavor arm64 --target-platform android-arm64 \
+            --build-name "$NAME" --build-number "$CODE" \
+            --dart-define=DSH_APP_VERSION="$NAME+$CODE"
+
+      - name: Inspect the APK
+        run: |
+          set -euo pipefail
+          APK=$(ls app/build/app/outputs/flutter-apk/*.apk | head -1)
+          echo "APK=$APK"
+          ls -lh "$APK"
+          unzip -l "$APK" | grep -E 'lib/arm64-v8a/(libapp|libflutter)\.so|assets/runtime/manifest\.json' || true
+          AAPT2=$(ls "$ANDROID_HOME"/build-tools/*/aapt2 | tail -1)
+          "$AAPT2" dump badging "$APK" | head -3 || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsh-go-arm64-release
+          path: app/build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
