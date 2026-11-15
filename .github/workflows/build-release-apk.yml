@@ -56,14 +56,20 @@ jobs:
           set -eu
           FLUTTER_ROOT=$(dirname "$(dirname "$(command -v flutter)")")
           echo "FLUTTER_ROOT=$FLUTTER_ROOT"
-          EXT=$(grep -rl 'compileSdkVersion' "$FLUTTER_ROOT/packages/flutter_tools/gradle/src/main/kotlin" 2>/dev/null | head -1)
+          EXT="$FLUTTER_ROOT/packages/flutter_tools/gradle/src/main/kotlin/FlutterExtension.kt"
+          if [ ! -f "$EXT" ]; then
+            EXT=$(grep -rlE 'val compileSdkVersion' "$FLUTTER_ROOT/packages/flutter_tools/gradle" 2>/dev/null | head -1)
+          fi
           echo "EXT=$EXT"
           COMPILE_SDK=''
           NDK=''
-          if [ -n "$EXT" ]; then
-            COMPILE_SDK=$(sed -nE 's/.*compileSdkVersion[^0-9]*([0-9]+).*/\1/p' "$EXT" | head -1)
-            NDK=$(sed -nE 's/.*ndkVersion[^"]*"([^"]+)".*/\1/p' "$EXT" | head -1)
+          if [ -n "$EXT" ] && [ -f "$EXT" ]; then
+            COMPILE_SDK=$(sed -nE 's/.*val compileSdkVersion[^0-9]*([0-9]+).*/\1/p' "$EXT" | head -1)
+            NDK=$(sed -nE 's/.*val ndkVersion[^"]*"([^"]+)".*/\1/p' "$EXT" | head -1)
           fi
+          # A stray single digit is a mis-parse, not a real SDK level.
+          case "$COMPILE_SDK" in ''|*[!0-9]*) COMPILE_SDK='' ;; esac
+          [ ${#COMPILE_SDK} -ge 2 ] || COMPILE_SDK=''
           echo "compileSdk=$COMPILE_SDK ndk=$NDK"
           SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           WANT=()
